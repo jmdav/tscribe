@@ -1,0 +1,3 @@
+# Ignore input and output folders used by transcribr
+/in/
+/out/
