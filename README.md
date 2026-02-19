@@ -1,3 +1,3 @@
-# transcribr
-Simple script for batch transcribing audio using Whisper.
-Includes options for cleaning files using other local models.
+# tScribe
+
+Simple Python script with streamlit GUI for batch transcribing audio files.
