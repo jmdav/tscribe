@@ -1,10 +1,15 @@
 import streamlit as st
 import time
+import subprocess
 from pathlib import Path
 from faster_whisper import WhisperModel
 import torch
 import requests
 import re
+import json
+import logging
+
+logging.basicConfig(level=logging.WARNING)
 
 # --- CONFIGURATION & SETUP ---
 st.set_page_config(page_title="tScribe", page_icon="📎", layout="wide")
@@ -14,6 +19,9 @@ hide_st_style = """
             [data-testid="stToolbar"] {visibility: hidden !important;}
             [data-testid="stHeader"] {visibility: hidden !important;}
             footer {visibility: hidden !important;}
+            .stMarkdown h1 a, .stMarkdown h2 a, .stMarkdown h3 a,
+            .stMarkdown h4 a, .stMarkdown h5 a, .stMarkdown h6 a,
+            [data-testid="stHeaderActionElements"] {display: none !important;}
             </style>
             """
 st.markdown(hide_st_style, unsafe_allow_html=True)
@@ -28,27 +36,88 @@ MODEL_STATS = {
 }
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=True)
 def load_model(model_size: str, device: str):
-    compute_type = "float16" if device == "cuda" else "int8"
-    return WhisperModel(model_size, device=device, compute_type=compute_type)
+    try:
+        if device == "cuda":
+            compute_type = "float16"
+        elif device == "mps":
+            # MPS doesn't support int8; use float16
+            compute_type = "float16"
+        else:
+            compute_type = "int8"
+        return WhisperModel(model_size, device=device, compute_type=compute_type)
+    except Exception as e:
+        st.error(f"Failed to load model '{model_size}': {e}")
+        raise
 
 
 def find_media_files(directory: Path, exts=None):
     if exts is None:
         exts = {".mp3", ".wav", ".m4a", ".mp4", ".mov", ".flac", ".aac", ".ogg"}
-    return [p for p in directory.rglob("*") if p.is_file() and p.suffix.lower() in exts]
+    if not directory.exists():
+        return []
+    try:
+        return sorted(
+            [
+                p
+                for p in directory.rglob("*")
+                if p.is_file() and p.suffix.lower() in exts
+            ]
+        )
+    except PermissionError:
+        return []
 
 
-# --- NEW: OLLAMA HELPERS ---
+def get_media_duration(filepath: Path) -> str:
+    """Get duration of a media file using ffprobe. Returns formatted string like '1:23:45'."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(filepath),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        seconds = float(result.stdout.strip())
+        h, remainder = divmod(int(seconds), 3600)
+        m, s = divmod(remainder, 60)
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+    except Exception:
+        return "—"
+
+
+def validate_directory(directory: Path, create: bool = True) -> bool:
+    """Validate and optionally create directory. Returns True if accessible."""
+    try:
+        if create:
+            directory.mkdir(parents=True, exist_ok=True)
+        return directory.exists() and directory.is_dir()
+    except (PermissionError, OSError):
+        return False
+
+
+# --- OLLAMA HELPERS ---
+@st.cache_data(ttl=30, show_spinner=False)
 def get_ollama_models():
-    """Fetches installed models from the local Ollama instance."""
+    """Fetches installed models from the local Ollama instance. Cached for 30s."""
     try:
         response = requests.get("http://localhost:11434/api/tags", timeout=2)
         response.raise_for_status()
         models = response.json().get("models", [])
         return [m["name"] for m in models]
-    except Exception:
+    except (requests.ConnectionError, requests.Timeout):
+        return []
+    except Exception as e:
+        logging.warning(f"Failed to fetch Ollama models: {e}")
         return []
 
 
@@ -110,10 +179,16 @@ st.title("tScribe")
 
 # --- CONFIGURATION ---
 with st.expander("Config", expanded=True):
-    col1, col2, col3 = st.columns(3)
+    col_left, col_right = st.columns(2)
 
-    with col1:
-        input_dir_str = st.text_input("Input Directory", value="in")
+    with col_left:
+        st.caption("DIRECTORIES")
+        input_dir_str = st.text_input("Input", value="in")
+        output_dir_str = st.text_input("Output", value="out")
+        processed_dir_str = st.text_input("Processed", value="processed")
+
+    with col_right:
+        st.caption("TRANSCRIPTION")
         model_size = st.selectbox(
             "Model",
             options=list(MODEL_STATS.keys()),
@@ -121,184 +196,255 @@ with st.expander("Config", expanded=True):
             index=5,
             help="Select an optimized model based on your available RAM/VRAM.",
         )
-
-    with col2:
-        output_dir_str = st.text_input("Raw Output Directory", value="out")
         device_options = ["cpu"]
         if torch.cuda.is_available():
             device_options.insert(0, "cuda")
-        device = st.selectbox("Compute Device", device_options)
-
-    with col3:
-        # NEW: Processed directory input
-        processed_dir_str = st.text_input("Processed Directory", value="processed")
-
-    st.divider()
-
-    col_vad1, col_vad2 = st.columns(2)
-    with col_vad1:
-        enable_vad = st.checkbox(
-            "Enable VAD Filter",
-            value=True,
-            help="Filters out silence before transcribing to drastically improve speed.",
-        )
-    with col_vad2:
-        vad_silence_ms = st.number_input(
-            "VAD Min Silence (ms)", value=2000, step=500, disabled=not enable_vad
-        )
-
-    st.divider()
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device_options.insert(0, "mps")
+        dev_col, vad_col = st.columns(2)
+        with dev_col:
+            device = st.selectbox("Device", device_options)
+        with vad_col:
+            enable_vad = st.selectbox(
+                "VAD Filter",
+                options=[True, False],
+                index=0,
+                format_func=lambda x: "Enabled" if x else "Disabled",
+                help="Filters out silence before transcribing.",
+            )
+        if enable_vad:
+            vad_silence_ms = st.number_input(
+                "VAD Min Silence (ms)", value=2000, step=500
+            )
+        else:
+            vad_silence_ms = 2000
 
 input_dir = Path(input_dir_str).expanduser().resolve()
 output_dir = Path(output_dir_str).expanduser().resolve()
-processed_dir = Path(processed_dir_str).expanduser().resolve()  # NEW
+processed_dir = Path(processed_dir_str).expanduser().resolve()
 
-# Ensure all directories exist
-for d in [input_dir, output_dir, processed_dir]:
-    try:
-        d.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
+# Validate all directories
+errors = []
+if not validate_directory(input_dir, create=True):
+    errors.append(f"Cannot access input directory: {input_dir}")
+if not validate_directory(output_dir, create=True):
+    errors.append(f"Cannot access output directory: {output_dir}")
+if not validate_directory(processed_dir, create=True):
+    errors.append(f"Cannot access processed directory: {processed_dir}")
+
+if errors:
+    for error in errors:
+        st.error(error)
 
 
 # --- THE FRAGMENT ---
 @st.fragment
-def run_transcription_engine(in_dir, out_dir, mod_size, dev, use_vad, vad_ms):
-    col1, col2, col3 = st.columns([3, 2, 5])
+def run_transcription_engine(in_dir, out_dir, proc_dir, mod_size, dev, use_vad, vad_ms):
+    media_files = find_media_files(in_dir)
+
+    col1, col2 = st.columns([1, 2])
+
     with col1:
+        st.markdown("##### Select Files to Transcribe")
+        if media_files:
+            all_media_names = [f.name for f in media_files]
+
+            sel_col, btn_col = st.columns([1, 1])
+            with sel_col:
+                if st.button("Select All", width="stretch", key="select_all_media"):
+                    st.session_state.media_pills = list(all_media_names)
+                    st.rerun()
+            with btn_col:
+                if st.button("Clear", width="stretch", key="clear_media"):
+                    st.session_state.media_pills = []
+                    st.rerun()
+
+            selected_media = st.pills(
+                "Files:",
+                all_media_names,
+                default=st.session_state.get("media_pills", list(all_media_names)),
+                selection_mode="multi",
+                key="media_pills",
+            )
+        else:
+            selected_media = []
+            st.info("No media files found in input directory.")
+
+        # Build lookup for selected files
+        media_lookup = {f.name: f for f in media_files}
+        selected_paths = [
+            media_lookup[name] for name in selected_media if name in media_lookup
+        ]
+
         start_btn = st.button(
-            "Start Batch Transcription", type="primary", use_container_width=True
+            (
+                f"Transcribe {len(selected_paths)} File(s)"
+                if selected_paths
+                else "No Files Selected"
+            ),
+            type="primary",
+            width="stretch",
+            disabled=not selected_paths,
         )
 
-    if start_btn:
-        files = find_media_files(in_dir)
-        if not files:
-            st.warning(f"No media files found in `{in_dir}`")
-            return
+    with col2:
+        # Show summary of selected files
+        if selected_paths:
+            st.markdown("**Selected Files:**")
+            summary_data = [
+                {
+                    "Filename": f.name,
+                    "Type": f.suffix.upper().lstrip("."),
+                    "Length": get_media_duration(f),
+                    "Size (MB)": round(f.stat().st_size / 1048576, 2),
+                }
+                for f in selected_paths
+            ]
+            st.dataframe(summary_data, hide_index=True, use_container_width=True)
 
-        log_container = st.empty()
-        logs = []
+        if start_btn and selected_paths:
+            log_container = st.empty()
+            logs = []
 
-        def log_msg(msg):
-            logs.append(msg)
-            log_container.code("\n".join(logs[-12:]), language="text")
+            def log_msg(msg):
+                logs.append(msg)
+                log_container.code("\n".join(logs[-12:]), language="text")
 
-        log_msg(f"Loading '{mod_size}' model on {dev}...")
-        model = load_model(mod_size, dev)
-        log_msg(f"Model loaded. Starting batch processing of {len(files)} file(s).")
+            log_msg(f"Loading '{mod_size}' model on {dev}...")
+            model = load_model(mod_size, dev)
+            log_msg(
+                f"Model loaded. Starting batch processing of {len(selected_paths)} file(s)."
+            )
 
-        vad_params = dict(min_silence_duration_ms=vad_ms) if use_vad else None
-        start_time = time.time()
+            vad_params = dict(min_silence_duration_ms=vad_ms) if use_vad else None
+            start_time = time.time()
 
-        for i, src in enumerate(files):
-            rel_path = src.relative_to(in_dir)
-            out_txt = (out_dir / rel_path).with_suffix(".txt")
-            out_txt.parent.mkdir(parents=True, exist_ok=True)
+            for i, src in enumerate(selected_paths):
+                rel_path = src.relative_to(in_dir)
+                out_txt = (out_dir / rel_path).with_suffix(".txt")
+                out_txt.parent.mkdir(parents=True, exist_ok=True)
 
-            log_msg(f"Processing ({i+1}/{len(files)}): {src.name}")
+                log_msg(f"Processing ({i+1}/{len(selected_paths)}): {src.name}")
 
-            if out_txt.exists():
-                log_msg(f"Skipped (already exists): {out_txt.name}")
-            else:
-                try:
-                    segments, info = model.transcribe(
-                        str(src),
-                        language="en",
-                        vad_filter=use_vad,
-                        vad_parameters=vad_params,
-                        beam_size=5,
-                    )
+                if out_txt.exists():
+                    log_msg(f"Skipped (already exists): {out_txt.name}")
+                else:
+                    try:
+                        segments, info = model.transcribe(
+                            str(src),
+                            language="en",
+                            vad_filter=use_vad,
+                            vad_parameters=vad_params,
+                            beam_size=5,
+                        )
+                    except Exception as e:
+                        log_msg(
+                            f"! Transcription failed on {src.name}: {type(e).__name__}: {e}"
+                        )
+                        continue
 
                     file_progress = st.progress(
-                        0.0, text=f"Analyzing audio length... ({info.duration:.1f}s)"
+                        0.0, text=f"Processing {info.duration:.1f}s audio..."
                     )
-                    live_text_preview = st.empty()
+                    live_preview = st.empty()
 
                     text_chunks = []
-                    for segment in segments:
-                        text_chunks.append(segment.text)
+                    segment_count = 0
+                    try:
+                        for segment in segments:
+                            text_chunks.append(segment.text)
+                            segment_count += 1
 
-                        percent_done = min(segment.end / info.duration, 1.0)
+                            if segment_count % 5 == 0 or segment.end >= info.duration:
+                                percent_done = min(segment.end / info.duration, 1.0)
+                                file_progress.progress(
+                                    percent_done,
+                                    text=f"Transcribing *{src.name}*: {percent_done:.0%}",
+                                )
+                                live_preview.caption(
+                                    f"...{segment.text.strip()[-120:]}"
+                                )
 
-                        file_progress.progress(
-                            percent_done,
-                            text=f"Transcribing *{src.name}*: **{percent_done:.0%} ({segment.end:.1f}s / {info.duration:.1f}s)**",
-                        )
-                        live_text_preview.markdown(f"**Live Preview:** {segment.text}")
+                        file_progress.empty()
+                        live_preview.empty()
 
-                    file_progress.empty()
-                    live_text_preview.empty()
+                        text = " ".join(text_chunks).strip()
+                        out_txt.write_text(text, encoding="utf-8")
+                        log_msg(f"Wrote transcript: {out_txt.name} ({len(text)} chars)")
+                    except Exception as e:
+                        log_msg(f"! Processing error on {src.name}: {type(e).__name__}")
+                        file_progress.empty()
+                        live_preview.empty()
 
-                    text = "".join(text_chunks)
-                    out_txt.write_text(text.strip(), encoding="utf-8")
-                    log_msg(f"Wrote transcript: {out_txt.name}")
-                except Exception as e:
-                    log_msg(f"! Error on {src.name}: {e}")
+            total_time = time.time() - start_time
+            m, s = divmod(int(total_time), 60)
+            h, m = divmod(m, 60)
+            total_str = f"{h}h {m:02d}m {s:02d}s" if h > 0 else f"{m:02d}m {s:02d}s"
 
-        total_time = time.time() - start_time
-        m, s = divmod(int(total_time), 60)
-        h, m = divmod(m, 60)
-        total_str = f"{h}h {m:02d}m {s:02d}s" if h > 0 else f"{m:02d}m {s:02d}s"
-
-        st.success(f"Batch processing complete in {total_str}!")
+            st.success(f"Batch processing complete in {total_str}!")
+            st.rerun()
 
 
-# Note the new tab for post-processing
-tab_transcribe, tab_files, tab_viewer, tab_post = st.tabs(
-    ["Process", "Input", "Output", "Post-Process (Ollama)"]
-)
+tab_transcribe, tab_viewer, tab_edit = st.tabs(["Transcribe", "Transcripts", "Edit"])
 
 # --- TAB 1: TRANSCRIPTION ---
 with tab_transcribe:
     run_transcription_engine(
-        input_dir, output_dir, model_size, device, enable_vad, vad_silence_ms
+        input_dir,
+        output_dir,
+        processed_dir,
+        model_size,
+        device,
+        enable_vad,
+        vad_silence_ms,
     )
 
-# --- TAB 2: INPUT EXPLORER ---
-with tab_files:
-    if input_dir.exists():
-        media_files = find_media_files(input_dir)
-        if media_files:
-            st.dataframe(
-                [
-                    {
-                        "Filename": f.name,
-                        "Size (MB)": round(f.stat().st_size / 1048576, 2),
-                    }
-                    for f in media_files
-                ],
-                width="content",
-            )
-        else:
-            st.info("No media files found in the input directory.")
-    else:
-        st.error(f"Directory not found: `{input_dir}`")
-
-# --- TAB 3: TRANSCRIPT VIEWER ---
+# --- TAB 2: TRANSCRIPT VIEWER ---
 with tab_viewer:
+    viewer_sources = {}
     if output_dir.exists():
-        txt_files = list(output_dir.rglob("*.txt"))
-        if txt_files:
-            selected = st.selectbox(
-                "Select a transcript to preview:",
-                [str(f.relative_to(output_dir)) for f in txt_files],
-            )
-            if selected:
-                file_path = output_dir / selected
-                content = file_path.read_text(encoding="utf-8")
+        for f in sorted(output_dir.rglob("*.txt")):
+            viewer_sources[f"[raw] {f.relative_to(output_dir)}"] = f
+    if processed_dir.exists():
+        for f in sorted(processed_dir.rglob("*.txt")):
+            viewer_sources[f"[edited] {f.relative_to(processed_dir)}"] = f
 
+    if viewer_sources:
+        viewer_col1, viewer_col2 = st.columns([1, 2])
+
+        with viewer_col1:
+            selected_transcript = st.selectbox(
+                "Select a transcript:",
+                list(viewer_sources.keys()),
+            )
+            if selected_transcript:
+                file_path = viewer_sources[selected_transcript]
+                content = file_path.read_text(encoding="utf-8")
+                word_count = len(content.split())
+
+                st.caption(f"{word_count:,} words · {len(content):,} chars")
                 st.download_button(
                     label="Download .txt",
                     data=content,
                     file_name=file_path.name,
                     mime="text/plain",
+                    width="stretch",
                 )
-                st.text_area("Content", content, height=400, disabled=False)
-        else:
-            st.info("No transcripts found yet. Run the transcription engine first!")
 
-# --- TAB 4: OLLAMA BATCH POST-PROCESSING ---
-with tab_post:
+        with viewer_col2:
+            if selected_transcript:
+                st.text_area(
+                    "Content",
+                    content,
+                    height=500,
+                    disabled=False,
+                    label_visibility="collapsed",
+                )
+    else:
+        st.info("No transcripts found yet. Run the transcription engine first!")
+
+# --- TAB 3: OLLAMA BATCH POST-PROCESSING ---
+with tab_edit:
     st.subheader("AI Grammar & Editing Studio")
 
     ollama_models = get_ollama_models()
@@ -312,16 +458,38 @@ with tab_post:
             txt_files = list(output_dir.rglob("*.txt"))
 
             if txt_files:
-                col1, col2 = st.columns([1, 2])
+                edit_col1, edit_col2 = st.columns([1, 2])
 
-                with col1:
-                    st.markdown("##### Batch Setup")
-                    # NEW: Multiselect allows batching multiple files at once
-                    target_files = st.multiselect(
-                        "Select Transcripts to Edit:",
-                        [str(f.relative_to(output_dir)) for f in txt_files],
-                        default=[str(f.relative_to(output_dir)) for f in txt_files],
+                with edit_col1:
+                    st.markdown("##### Select Transcripts to Edit")
+                    all_file_options = [
+                        str(f.relative_to(output_dir)) for f in txt_files
+                    ]
+
+                    sel_col, btn_col = st.columns([1, 1])
+                    with sel_col:
+                        if st.button(
+                            "Select All",
+                            width="stretch",
+                            key="select_all_transcripts",
+                        ):
+                            st.session_state.edit_pills = list(all_file_options)
+                            st.rerun()
+                    with btn_col:
+                        if st.button("Clear", width="stretch", key="clear_transcripts"):
+                            st.session_state.edit_pills = []
+                            st.rerun()
+
+                    target_files = st.pills(
+                        "Files:",
+                        all_file_options,
+                        default=st.session_state.get(
+                            "edit_pills", list(all_file_options)
+                        ),
+                        selection_mode="multi",
+                        key="edit_pills",
                     )
+
                     selected_model = st.selectbox("Select Ollama Model:", ollama_models)
 
                     st.markdown("##### Inference Settings")
@@ -336,7 +504,6 @@ with tab_post:
                         "Temperature", min_value=0.0, max_value=1.0, value=0.0, step=0.1
                     )
 
-                    # UPDATED: Now uses word counts to match the regex chunker
                     chunk_size = st.slider(
                         "Chunk Size (Words)",
                         min_value=500,
@@ -350,20 +517,42 @@ with tab_post:
                         value="You are an expert copyeditor. Fix transcription errors, correct the grammar, and format the following lecture transcript. You MUST preserve all original content, concepts, and structure. Do not summarize or remove information. Output only the corrected text.",
                     )
 
-                with col2:
+                with edit_col2:
+                    # Show details table for selected files
+                    if target_files:
+                        st.dataframe(
+                            [
+                                {
+                                    "Filename": name,
+                                    "Words": len(
+                                        (output_dir / name)
+                                        .read_text(encoding="utf-8")
+                                        .split()
+                                    ),
+                                    "Size (KB)": round(
+                                        (output_dir / name).stat().st_size / 1024, 1
+                                    ),
+                                }
+                                for name in target_files
+                                if (output_dir / name).exists()
+                            ],
+                            width="stretch",
+                            hide_index=True,
+                        )
+
                     btn_col1, btn_col2 = st.columns(2)
                     with btn_col1:
                         process_btn = st.button(
                             "Start Batch Editing",
                             type="primary",
-                            use_container_width=True,
+                            width="stretch",
                             key="start_batch_edit",
                         )
                     with btn_col2:
                         cancel_btn = st.button(
                             "🛑 Stop Batch & Save Current",
                             type="secondary",
-                            use_container_width=True,
+                            width="stretch",
                             key="stop_batch_edit",
                         )
 
@@ -373,6 +562,7 @@ with tab_post:
                         st.session_state.current_file = ""
 
                     if cancel_btn:
+                        st.session_state.cancel_batch = True
                         if (
                             st.session_state.partial_text
                             and st.session_state.current_file
@@ -380,7 +570,6 @@ with tab_post:
                             safe_model_name = selected_model.replace(":", "-").replace(
                                 "/", "_"
                             )
-                            # Save rescues to the new processed_dir
                             partial_file = (
                                 processed_dir
                                 / f"{Path(st.session_state.current_file).stem}_{safe_model_name}_PARTIAL.txt"
@@ -389,23 +578,26 @@ with tab_post:
                                 st.session_state.partial_text, encoding="utf-8"
                             )
                             st.warning(
-                                f"Batch halted. Rescued progress saved to Processed folder as `{partial_file.name}`."
+                                f"Batch halted. Progress saved: `{partial_file.name}`"
                             )
                             st.session_state.partial_text = ""
                             st.session_state.current_file = ""
                         else:
                             st.info("Batch canceled.")
+                        st.session_state.cancel_batch = False
 
                     if process_btn and target_files:
-                        import json
-
                         st.session_state.partial_text = ""
+                        st.session_state.cancel_batch = False
                         safe_model_name = selected_model.replace(":", "-").replace(
                             "/", "_"
                         )
 
-                        # NEW: Outer loop iterating through all selected files
+                        # Outer loop iterating through all selected files
                         for file_index, file_str in enumerate(target_files):
+                            if st.session_state.get("cancel_batch", False):
+                                st.warning("Batch canceled by user.")
+                                break
                             file_path = output_dir / file_str
                             st.session_state.current_file = file_path.name
 
@@ -430,6 +622,9 @@ with tab_post:
                                 edited_text_placeholder = st.empty()
 
                             for i, (context_text, chunk) in enumerate(chunks):
+                                if st.session_state.get("cancel_batch", False):
+                                    break
+
                                 if context_text:
                                     user_prompt = (
                                         f"For grammatical continuity, here is the end of the previous section. "
@@ -439,6 +634,18 @@ with tab_post:
                                     )
                                 else:
                                     user_prompt = f"TEXT TO EDIT:\n{chunk}"
+
+                                # Validate context window isn't too small
+                                actual_context = len(user_prompt.split()) + len(
+                                    system_prompt.split()
+                                )
+                                if context_window < actual_context + 100:
+                                    st.warning(
+                                        f"Context window ({context_window}) may be insufficient. Increasing to {actual_context + 500}."
+                                    )
+                                    effective_context = actual_context + 500
+                                else:
+                                    effective_context = context_window
 
                                 payload = {
                                     "model": selected_model,
@@ -450,7 +657,7 @@ with tab_post:
                                     "options": {
                                         "temperature": temperature,
                                         "num_predict": -1,
-                                        "num_ctx": context_window,
+                                        "num_ctx": effective_context,
                                     },
                                 }
 
@@ -464,46 +671,95 @@ with tab_post:
                                         )
                                         res.raise_for_status()
 
+                                        chunk_tokens = []
+                                        token_count = 0
+                                        last_ui_update = time.time()
                                         for line in res.iter_lines():
                                             if line:
-                                                body = json.loads(line)
-                                                if (
-                                                    "message" in body
-                                                    and "content" in body["message"]
-                                                ):
-                                                    token = body["message"]["content"]
+                                                try:
+                                                    body = json.loads(line)
+                                                    if (
+                                                        "message" in body
+                                                        and "content"
+                                                        in body.get("message", {})
+                                                    ):
+                                                        token = body["message"][
+                                                            "content"
+                                                        ]
+                                                        chunk_tokens.append(token)
+                                                        st.session_state.partial_text += (
+                                                            token
+                                                        )
+                                                        token_count += 1
 
-                                                    st.session_state.partial_text += (
-                                                        token
-                                                    )
+                                                        # Live update every 0.3s for responsiveness
+                                                        now = time.time()
+                                                        if now - last_ui_update >= 0.3:
+                                                            last_ui_update = now
+                                                            current_words = len(
+                                                                st.session_state.partial_text.split()
+                                                            )
+                                                            pct = min(
+                                                                current_words
+                                                                / total_words,
+                                                                1.0,
+                                                            )
+                                                            progress_bar.progress(
+                                                                pct,
+                                                                text=f"Chunk {i+1}/{len(chunks)} · ~{current_words} / {total_words} words",
+                                                            )
+                                                            # Show tail of generated text for live feel
+                                                            preview = st.session_state.partial_text[
+                                                                -1500:
+                                                            ]
+                                                            if (
+                                                                len(
+                                                                    st.session_state.partial_text
+                                                                )
+                                                                > 1500
+                                                            ):
+                                                                preview = (
+                                                                    "..." + preview
+                                                                )
+                                                            edited_text_placeholder.markdown(
+                                                                preview + "▌"
+                                                            )
+                                                except json.JSONDecodeError:
+                                                    continue
 
-                                                    current_words = len(
-                                                        st.session_state.partial_text.split()
-                                                    )
-                                                    pct = min(
-                                                        current_words / total_words, 1.0
-                                                    )
-                                                    progress_bar.progress(
-                                                        pct,
-                                                        text=f"Edited ~{current_words} / {total_words} words",
-                                                    )
-
-                                                    edited_text_placeholder.markdown(
-                                                        st.session_state.partial_text
-                                                        + "▌"
-                                                    )
-
-                                        edited_text_placeholder.markdown(
-                                            st.session_state.partial_text
+                                        # Final update for this chunk
+                                        current_words = len(
+                                            st.session_state.partial_text.split()
                                         )
+                                        pct = min(current_words / total_words, 1.0)
+                                        progress_bar.progress(
+                                            pct,
+                                            text=f"Edited ~{current_words} / {total_words} words",
+                                        )
+                                        preview = st.session_state.partial_text[-1500:]
+                                        if len(st.session_state.partial_text) > 1500:
+                                            preview = "..." + preview
+                                        edited_text_placeholder.markdown(preview)
                                         st.session_state.partial_text += "\n\n"
 
+                                except requests.exceptions.Timeout:
+                                    st.error(
+                                        f"Timeout on chunk {i+1}: Ollama took too long. Check if model is running."
+                                    )
+                                    break
+                                except requests.exceptions.ConnectionError:
+                                    st.error(
+                                        f"Connection error on chunk {i+1}: Cannot reach Ollama at localhost:11434. Is it running?"
+                                    )
+                                    break
                                 except Exception as e:
-                                    st.error(f"Ollama API Error on chunk {i+1}: {e}")
+                                    st.error(
+                                        f"Error on chunk {i+1}: {type(e).__name__}: {e}"
+                                    )
                                     break
 
                             if st.session_state.partial_text:
-                                # NEW: Save completed files to the processed_dir
+                                # Save completed files to the processed_dir
                                 new_file_path = (
                                     processed_dir
                                     / f"{file_path.stem}_{safe_model_name}.txt"
