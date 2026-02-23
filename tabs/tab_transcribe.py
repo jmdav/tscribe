@@ -1,0 +1,166 @@
+import time
+import streamlit as st
+from pathlib import Path
+
+from utils.file_utils import find_media_files, get_media_duration
+from utils.model import load_model
+
+
+@st.fragment
+def render_transcribe_tab(
+    in_dir: Path,
+    out_dir: Path,
+    proc_dir: Path,
+    mod_size: str,
+    dev: str,
+    use_vad: bool,
+    vad_ms: int,
+):
+    media_files = find_media_files(in_dir)
+
+    col1, col2 = st.columns([1, 2])
+
+    with col1:
+        st.markdown("##### Select Files to Transcribe")
+        if media_files:
+            all_media_names = [f.name for f in media_files]
+
+            # Initialize session state if not present
+            if "media_pills" not in st.session_state:
+                st.session_state.media_pills = list(all_media_names)
+
+            sel_col, btn_col, refresh_col = st.columns([2, 2, 1])
+            with sel_col:
+                if st.button("Select All", width="stretch", key="select_all_media"):
+                    st.session_state.media_pills = list(all_media_names)
+                    st.rerun()
+            with btn_col:
+                if st.button("Clear", width="stretch", key="clear_media"):
+                    st.session_state.media_pills = []
+                    st.rerun()
+            with refresh_col:
+                if st.button("⟳", width="stretch", key="refresh_media"):
+                    st.rerun()
+
+            selected_media = st.pills(
+                "Files:",
+                all_media_names,
+                selection_mode="multi",
+                key="media_pills",
+            )
+        else:
+            selected_media = []
+            st.info("No media files found in input directory.")
+
+        # Build lookup for selected files
+        media_lookup = {f.name: f for f in media_files}
+        selected_paths = [
+            media_lookup[name] for name in selected_media if name in media_lookup
+        ]
+
+        start_btn = st.button(
+            (
+                f"Transcribe {len(selected_paths)} File(s)"
+                if selected_paths
+                else "No Files Selected"
+            ),
+            type="primary",
+            width="stretch",
+            disabled=not selected_paths,
+        )
+
+    with col2:
+        if selected_paths:
+            st.markdown("**Selected Files:**")
+            summary_data = [
+                {
+                    "Filename": f.name,
+                    "Type": f.suffix.upper().lstrip("."),
+                    "Length": get_media_duration(f),
+                    "Size (MB)": round(f.stat().st_size / 1048576, 2),
+                }
+                for f in selected_paths
+            ]
+            st.dataframe(summary_data, hide_index=True, width="stretch")
+
+        if start_btn and selected_paths:
+            log_container = st.empty()
+            logs = []
+
+            def log_msg(msg):
+                logs.append(msg)
+                log_container.code("\n".join(logs[-12:]), language="text")
+
+            log_msg(f"Loading '{mod_size}' model on {dev}...")
+            model = load_model(mod_size, dev)
+            log_msg(
+                f"Model loaded. Starting batch processing of {len(selected_paths)} file(s)."
+            )
+
+            vad_params = dict(min_silence_duration_ms=vad_ms) if use_vad else None
+            start_time = time.time()
+
+            for i, src in enumerate(selected_paths):
+                rel_path = src.relative_to(in_dir)
+                out_txt = (out_dir / rel_path).with_suffix(".txt")
+                out_txt.parent.mkdir(parents=True, exist_ok=True)
+
+                log_msg(f"Processing ({i+1}/{len(selected_paths)}): {src.name}")
+
+                if out_txt.exists():
+                    log_msg(f"Skipped (already exists): {out_txt.name}")
+                else:
+                    try:
+                        segments, info = model.transcribe(
+                            str(src),
+                            language="en",
+                            vad_filter=use_vad,
+                            vad_parameters=vad_params,
+                            beam_size=5,
+                        )
+                    except Exception as e:
+                        log_msg(
+                            f"! Transcription failed on {src.name}: {type(e).__name__}: {e}"
+                        )
+                        continue
+
+                    file_progress = st.progress(
+                        0.0, text=f"Processing {info.duration:.1f}s audio..."
+                    )
+                    live_preview = st.empty()
+
+                    text_chunks = []
+                    segment_count = 0
+                    try:
+                        for segment in segments:
+                            text_chunks.append(segment.text)
+                            segment_count += 1
+
+                            if segment_count % 5 == 0 or segment.end >= info.duration:
+                                percent_done = min(segment.end / info.duration, 1.0)
+                                file_progress.progress(
+                                    percent_done,
+                                    text=f"Transcribing *{src.name}*: {percent_done:.0%}",
+                                )
+                                live_preview.caption(
+                                    f"...{segment.text.strip()[-120:]}"
+                                )
+
+                        file_progress.empty()
+                        live_preview.empty()
+
+                        text = " ".join(text_chunks).strip()
+                        out_txt.write_text(text, encoding="utf-8")
+                        log_msg(f"Wrote transcript: {out_txt.name} ({len(text)} chars)")
+                    except Exception as e:
+                        log_msg(f"! Processing error on {src.name}: {type(e).__name__}")
+                        file_progress.empty()
+                        live_preview.empty()
+
+            total_time = time.time() - start_time
+            m, s = divmod(int(total_time), 60)
+            h, m = divmod(m, 60)
+            total_str = f"{h}h {m:02d}m {s:02d}s" if h > 0 else f"{m:02d}m {s:02d}s"
+
+            st.success(f"Batch processing complete in {total_str}!")
+            st.rerun()
