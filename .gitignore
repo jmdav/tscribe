@@ -2,4 +2,5 @@
 /in/
 /out/
 /processed/
+__pycache__/
 .DS_Store
