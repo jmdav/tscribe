@@ -1,8 +1,100 @@
+import html
 import time
 import streamlit as st
 from pathlib import Path
 
 from utils.diff_utils import generate_html_diff, build_paragraph_diffs, apply_rejection
+from components.clickable_diff import clickable_diff
+
+
+@st.fragment
+def render_diff_view(
+    selected_base: str, raw_text: str, proc_text: str, proc_file: Path
+):
+    """Isolated diff view that reruns only this section when rejections happen."""
+
+    def _rerun_fragment() -> None:
+        st.rerun(scope="fragment")
+
+    # Initialize rejection history in session state
+    if "rejection_history" not in st.session_state:
+        st.session_state.rejection_history = {}
+    if selected_base not in st.session_state.rejection_history:
+        st.session_state.rejection_history[selected_base] = []
+
+    # Track revision for forcing component refresh
+    if "diff_revision" not in st.session_state:
+        st.session_state.diff_revision = {}
+    if selected_base not in st.session_state.diff_revision:
+        st.session_state.diff_revision[selected_base] = 0
+
+    # --- UI Rendering ---
+    # Re-read proc_text to get the latest version for this render
+    current_proc_text = (
+        proc_file.read_text(encoding="utf-8") if proc_file.exists() else proc_text
+    )
+
+    # Undo button
+    undo_col1, undo_col2 = st.columns([8, 1])
+    with undo_col2:
+        if st.session_state.rejection_history[selected_base]:
+            undo_clicked = st.button(
+                "↶ Undo",
+                key=f"undo_{selected_base}",
+                help="Undo the last rejection",
+                type="secondary",
+            )
+            if undo_clicked:
+                previous_text = st.session_state.rejection_history[selected_base].pop()
+                proc_file.write_text(previous_text, encoding="utf-8")
+                st.session_state.diff_revision[selected_base] += 1
+                _rerun_fragment()
+
+    st.caption(
+        "Click changes to mark for rejection · Red = removed · Green = added (including line breaks) · Click 'Save Changes' to apply"
+    )
+
+    # Build continuous diff
+    para_diffs = build_paragraph_diffs(raw_text, current_proc_text)
+
+    # Flatten all segments (now just one "paragraph" containing everything)
+    all_segments = []
+    for para in para_diffs:
+        if para.get("segments"):
+            for seg in para["segments"]:
+                all_segments.append(seg)
+
+    # Render the clickable diff component with revision in key to force refresh
+    revision = st.session_state.diff_revision[selected_base]
+    save_action = clickable_diff(
+        segments=all_segments,
+        raw_text=raw_text,
+        edited_text=current_proc_text,
+        height=600,
+        key=f"diff_{selected_base}_v{revision}",
+    )
+
+    # Handle save action - apply all rejected changes in batch or save direct edits
+    if save_action is not None and save_action.get("action") == "save":
+        edited_text = save_action.get("edited_text")
+        rejected_changes = save_action.get("rejected_changes", [])
+
+        if edited_text is not None or rejected_changes:
+            # Save current state to history before applying rejections/edits
+            st.session_state.rejection_history[selected_base].append(current_proc_text)
+
+            if edited_text is not None:
+                updated_text = edited_text
+            else:
+                updated_text = current_proc_text
+                for change in rejected_changes:
+                    updated_text = apply_rejection(updated_text, change)
+
+            # Write the updated text to file
+            proc_file.write_text(updated_text, encoding="utf-8")
+            # Increment revision to force component refresh with new content
+            st.session_state.diff_revision[selected_base] += 1
+            _rerun_fragment()
 
 
 def render_review_tab(output_dir: Path, processed_dir: Path):
@@ -41,17 +133,18 @@ def render_review_tab(output_dir: Path, processed_dir: Path):
             sorted(list(all_bases)),
             index=0,
             format_func=lambda x: (f"[EDITED] {x}" if x in proc_map else f"[RAW] {x}"),
+            help="Choose which transcript to review. [EDITED] shows AI-processed version, [RAW] shows original transcription.",
         )
     with col2:
         view_mode = st.selectbox(
             "View Mode",
             [
-                "Split View",
                 "Diff View",
-                "Interactive Review",
+                "Split View",
                 "Raw Only",
                 "Edited Only",
             ],
+            help="Split View: side-by-side comparison. Diff View: highlights changes with undo support. Raw/Edited Only: single version.",
         )
     with col3:
         st.markdown("<br>", unsafe_allow_html=True)
@@ -88,91 +181,7 @@ def render_review_tab(output_dir: Path, processed_dir: Path):
     elif view_mode == "Diff View":
         if raw_text and proc_text:
             st.markdown("### Difference Highlight")
-            st.caption(
-                "Red (strikethrough) = removed · Green (bold) = added · Click ✕ to reject a change"
-            )
-
-            if "pending_rejection" not in st.session_state:
-                st.session_state.pending_rejection = None
-
-            if st.session_state.pending_rejection is not None:
-                chg = st.session_state.pending_rejection
-                current_text = proc_file.read_text(encoding="utf-8")
-                updated_text = apply_rejection(current_text, chg)
-                proc_file.write_text(updated_text, encoding="utf-8")
-                st.session_state.pending_rejection = None
-                st.rerun()
-
-            para_diffs = build_paragraph_diffs(raw_text, proc_text)
-
-            all_segments = []
-            for p_idx, para in enumerate(para_diffs):
-                for seg in para["segments"]:
-                    all_segments.append((p_idx, seg))
-
-            prev_p_idx = None
-            for seg_idx, (p_idx, seg) in enumerate(all_segments):
-                if prev_p_idx is not None and p_idx != prev_p_idx:
-                    st.markdown(
-                        '<hr style="border: none; border-top: 1px solid #333; margin: 6px 0;">',
-                        unsafe_allow_html=True,
-                    )
-                prev_p_idx = p_idx
-
-                chg = seg["change"]
-                if chg is not None:
-                    left_col, right_col = st.columns([3, 2])
-                    with left_col:
-                        st.markdown(
-                            f'<div style="padding: 0.5rem 0.75rem; background-color: #1E1E1E; color: #E0E0E0; '
-                            f'border-radius: 5px; line-height: 1.6; margin-bottom: 2px;">'
-                            f'{seg["html"]}</div>',
-                            unsafe_allow_html=True,
-                        )
-                    with right_col:
-                        c_text, c_btn = st.columns([5, 1])
-                        with c_text:
-                            if chg["tag"] == "delete":
-                                st.markdown(
-                                    f'<div style="padding: 4px 8px; background-color: #3a1515; border-radius: 4px; '
-                                    f'font-size: 0.85em; color: #f0a0a0; margin-bottom: 2px;">'
-                                    f'<strong>Deleted:</strong> {chg["old"]}</div>',
-                                    unsafe_allow_html=True,
-                                )
-                            elif chg["tag"] == "insert":
-                                st.markdown(
-                                    f'<div style="padding: 4px 8px; background-color: #152a15; border-radius: 4px; '
-                                    f'font-size: 0.85em; color: #a0f0a0; margin-bottom: 2px;">'
-                                    f'<strong>Added:</strong> {chg["new"]}</div>',
-                                    unsafe_allow_html=True,
-                                )
-                            elif chg["tag"] == "replace":
-                                st.markdown(
-                                    f'<div style="padding: 4px 8px; background-color: #2a2a15; border-radius: 4px; '
-                                    f'font-size: 0.85em; color: #f0e0a0; margin-bottom: 2px;">'
-                                    f"<strong>Changed:</strong> "
-                                    f'<span style="text-decoration: line-through; color: #f0a0a0;">{chg["old"]}</span>'
-                                    f' → <span style="color: #a0f0a0;">{chg["new"]}</span></div>',
-                                    unsafe_allow_html=True,
-                                )
-                        with c_btn:
-                            st.button(
-                                "✕",
-                                key=f"reject_{selected_base}_{chg['id']}",
-                                type="secondary",
-                                help="Reject this change",
-                                on_click=lambda c=chg: st.session_state.__setitem__(
-                                    "pending_rejection", c
-                                ),
-                            )
-                else:
-                    st.markdown(
-                        f'<div style="padding: 0.5rem 0.75rem; background-color: #1E1E1E; color: #888; '
-                        f'border-radius: 5px; line-height: 1.6; margin-bottom: 2px;">'
-                        f'{seg["html"]}</div>',
-                        unsafe_allow_html=True,
-                    )
-
+            render_diff_view(selected_base, raw_text, proc_text, proc_file)
         elif not proc_text:
             st.info("No edited version available to compare. Go to the 'Edit' tab.")
         else:
@@ -190,82 +199,3 @@ def render_review_tab(output_dir: Path, processed_dir: Path):
             )
         else:
             st.warning("No edited content available.")
-
-    if view_mode == "Interactive Review":
-        if not raw_text or not proc_text:
-            st.warning(
-                "You need both a Raw and an Edited version to use Interactive Review."
-            )
-        else:
-            st.info(
-                "Review changes block-by-block. Edit the final text if needed, then click 'Approve'."
-            )
-
-            raw_paragraphs = [p for p in raw_text.split("\n\n") if p.strip()]
-            proc_paragraphs = [p for p in proc_text.split("\n\n") if p.strip()]
-
-            if (
-                "review_data" not in st.session_state
-                or st.session_state.get("review_base") != selected_base
-            ):
-                st.session_state.review_base = selected_base
-                st.session_state.review_data = {}
-                for idx, txt in enumerate(proc_paragraphs):
-                    st.session_state.review_data[idx] = txt
-
-            max_len = max(len(raw_paragraphs), len(proc_paragraphs))
-
-            with st.container(height=600):
-                for i in range(max_len):
-                    r_p = raw_paragraphs[i] if i < len(raw_paragraphs) else ""
-                    p_p = proc_paragraphs[i] if i < len(proc_paragraphs) else ""
-
-                    st.markdown(f"#### Segment {i+1}")
-
-                    r_col, diff_col, final_col = st.columns([1, 1, 1.5])
-
-                    with r_col:
-                        st.caption("Raw Input")
-                        st.text_area(
-                            f"raw_{i}",
-                            r_p,
-                            height=150,
-                            disabled=True,
-                            label_visibility="collapsed",
-                        )
-
-                    with diff_col:
-                        st.caption("Changes Detected")
-                        diff_html = generate_html_diff(r_p, p_p)
-                        st.markdown(
-                            f'<div style="background-color:#0e1117; padding:10px; border-radius:5px; height:150px; overflow-y:auto; font-size:14px; line-height:1.5; border:1px solid #303030;">{diff_html}</div>',
-                            unsafe_allow_html=True,
-                        )
-
-                    with final_col:
-                        st.caption("Final Output (Editable)")
-                        val = st.text_area(
-                            f"final_{i}",
-                            value=st.session_state.review_data.get(i, p_p),
-                            height=150,
-                            key=f"edit_area_{i}",
-                            label_visibility="collapsed",
-                        )
-                        st.session_state.review_data[i] = val
-
-                    st.divider()
-
-            st.markdown("### Final Actions")
-            c1, c2 = st.columns([1, 4])
-            with c1:
-                if st.button("💾 Save Verified Transcript", type="primary"):
-                    final_segments = []
-                    for i in range(max_len):
-                        final_segments.append(st.session_state.review_data.get(i, ""))
-
-                    full_text = "\n\n".join(final_segments)
-                    save_path = processed_dir / f"{selected_base}_VERIFIED.txt"
-                    save_path.write_text(full_text, encoding="utf-8")
-                    st.success(f"Saved verified transcript to: {save_path.name}")
-                    time.sleep(1)
-                    st.rerun()

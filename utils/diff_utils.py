@@ -44,167 +44,267 @@ def generate_html_diff(raw_text: str, edited_text: str) -> str:
 
 def build_paragraph_diffs(raw_text: str, edited_text: str):
     """
-    Build paragraph-aligned diff data. Returns a list of dicts, one per paragraph,
-    each containing:
-      - 'diff_html': the paragraph text with inline diff highlighting
+    Build continuous diff data that preserves newlines as visible changes.
+    Returns a list with a single dict containing:
+      - 'segments': the text with inline diff highlighting
       - 'changes': list of individual changes [{id, old, new, tag}]
     """
-    raw_paras = [p.strip() for p in re.split(r"\n\s*\n", raw_text) if p.strip()]
-    edited_paras = [p.strip() for p in re.split(r"\n\s*\n", edited_text) if p.strip()]
+    # Tokenize entire text while preserving newlines as separate tokens
+    raw_tokens = re.findall(r"\S+|\n", raw_text)
+    edited_tokens = re.findall(r"\S+|\n", edited_text)
 
-    para_matcher = difflib.SequenceMatcher(None, raw_paras, edited_paras)
-    result = []
-    change_id = 0
-
-    for tag, i1, i2, j1, j2 in para_matcher.get_opcodes():
-        if tag == "equal":
-            for idx in range(i1, i2):
-                para_result = _diff_paragraph(
-                    raw_paras[idx], edited_paras[j1 + (idx - i1)], change_id
-                )
-                change_id = para_result["next_id"]
-                result.append(para_result)
-        elif tag == "replace":
-            raw_slice = raw_paras[i1:i2]
-            edit_slice = edited_paras[j1:j2]
-            max_len = max(len(raw_slice), len(edit_slice))
-            for k in range(max_len):
-                rp = raw_slice[k] if k < len(raw_slice) else ""
-                ep = edit_slice[k] if k < len(edit_slice) else ""
-                para_result = _diff_paragraph(rp, ep, change_id)
-                change_id = para_result["next_id"]
-                result.append(para_result)
-        elif tag == "delete":
-            for idx in range(i1, i2):
-                para_result = _diff_paragraph(raw_paras[idx], "", change_id)
-                change_id = para_result["next_id"]
-                result.append(para_result)
-        elif tag == "insert":
-            for idx in range(j1, j2):
-                para_result = _diff_paragraph("", edited_paras[idx], change_id)
-                change_id = para_result["next_id"]
-                result.append(para_result)
-
-    return result
-
-
-def _diff_paragraph(raw_para: str, edited_para: str, start_id: int) -> dict:
-    """
-    Diff a single paragraph at the word level.
-    Returns dict with 'diff_html', 'changes' list, and 'next_id'.
-    """
-    raw_words = raw_para.split()
-    edited_words = edited_para.split()
-    matcher = difflib.SequenceMatcher(None, raw_words, edited_words)
+    matcher = difflib.SequenceMatcher(None, raw_tokens, edited_tokens)
 
     segments = []
-    cid = start_id
-    context_words_count = 8
-
+    change_id = 0
     opcodes = matcher.get_opcodes()
-    pending_context = []
+
+    def join_tokens(tokens):
+        """Join tokens, using actual newlines for \n tokens and spaces for words."""
+        result = []
+        for i, token in enumerate(tokens):
+            if token == "\n":
+                result.append("\n")
+            else:
+                if i > 0 and tokens[i - 1] != "\n":
+                    result.append(" ")
+                result.append(token)
+        return "".join(result)
+
+    def escape_with_newlines(text):
+        """Escape HTML and convert newlines to <br> tags."""
+        escaped = html_mod.escape(text)
+        return escaped.replace("\n", "<br>")
 
     for op_idx, (tag, i1, i2, j1, j2) in enumerate(opcodes):
+        # Build context references for rejection functionality
         context_before = ""
         context_after = ""
         for prev_idx in range(op_idx - 1, -1, -1):
             ptag, _, _, pj1, pj2 = opcodes[prev_idx]
             if ptag in ("equal", "insert", "replace") and pj2 > pj1:
-                words = edited_words[pj1:pj2]
+                words = [w for w in edited_tokens[pj1:pj2] if w != "\n"]
                 context_before = " ".join(words[-5:])
                 break
         for next_idx in range(op_idx + 1, len(opcodes)):
             ntag, _, _, nj1, nj2 = opcodes[next_idx]
             if ntag in ("equal", "insert", "replace") and nj2 > nj1:
-                words = edited_words[nj1:nj2]
+                words = [w for w in edited_tokens[nj1:nj2] if w != "\n"]
                 context_after = " ".join(words[:5])
                 break
 
         if tag == "equal":
-            equal_text = html_mod.escape(" ".join(raw_words[i1:i2]))
-            pending_context.append(equal_text)
-        else:
-            seg_html_parts = []
+            # Context text - not clickable
+            equal_text = escape_with_newlines(join_tokens(raw_tokens[i1:i2]))
+            segments.append({"html": equal_text, "change": None})
+        elif tag == "delete":
+            old_text = join_tokens(raw_tokens[i1:i2])
+            change_html = (
+                f'<span style="background-color: #5c2020; text-decoration: line-through; padding: 1px 3px; border-radius: 3px;">'
+                f"{escape_with_newlines(old_text)}</span>"
+            )
+            change_data = {
+                "id": change_id,
+                "old": old_text,
+                "new": "",
+                "tag": "delete",
+                "context_before": context_before,
+                "context_after": context_after,
+            }
+            segments.append({"html": change_html, "change": change_data})
+            change_id += 1
+        elif tag == "insert":
+            new_text = join_tokens(edited_tokens[j1:j2])
+            change_html = (
+                f'<span style="background-color: #1e4620; font-weight: bold; padding: 1px 3px; border-radius: 3px;">'
+                f"{escape_with_newlines(new_text)}</span>"
+            )
+            change_data = {
+                "id": change_id,
+                "old": "",
+                "new": new_text,
+                "tag": "insert",
+                "context_before": context_before,
+                "context_after": context_after,
+            }
+            segments.append({"html": change_html, "change": change_data})
+            change_id += 1
+        elif tag == "replace":
+            old_text = join_tokens(raw_tokens[i1:i2])
+            new_text = join_tokens(edited_tokens[j1:j2])
+            change_html = (
+                f'<span style="background-color: #5c2020; text-decoration: line-through; padding: 1px 3px; border-radius: 3px;">'
+                f"{escape_with_newlines(old_text)}</span> "
+                f'<span style="background-color: #1e4620; font-weight: bold; padding: 1px 3px; border-radius: 3px;">'
+                f"{escape_with_newlines(new_text)}</span>"
+            )
+            change_data = {
+                "id": change_id,
+                "old": old_text,
+                "new": new_text,
+                "tag": "replace",
+                "context_before": context_before,
+                "context_after": context_after,
+            }
+            segments.append({"html": change_html, "change": change_data})
+            change_id += 1
 
-            if pending_context:
-                full_context = " ".join(pending_context)
-                context_words_list = full_context.split()
-                if len(context_words_list) > context_words_count:
-                    earlier = " ".join(context_words_list[:-context_words_count])
-                    segments.append({"html": earlier, "change": None})
-                    seg_html_parts.append(
-                        '<span style="color: #888;">…</span> '
-                        + " ".join(context_words_list[-context_words_count:])
-                    )
-                else:
-                    seg_html_parts.append(full_context)
-                pending_context = []
+    all_changes = [s["change"] for s in segments if s["change"] is not None]
 
-            if tag == "delete":
-                old_text = " ".join(raw_words[i1:i2])
-                seg_html_parts.append(
-                    f'<span style="background-color: #5c2020; text-decoration: line-through; padding: 1px 3px; border-radius: 3px;">'
-                    f"{html_mod.escape(old_text)}</span>"
-                )
-                change_data = {
-                    "id": cid,
-                    "old": old_text,
-                    "new": "",
-                    "tag": "delete",
-                    "context_before": context_before,
-                    "context_after": context_after,
+    # Return as a single-paragraph result to maintain the same interface
+    return [{"segments": segments, "changes": all_changes}]
+
+
+def _diff_paragraph(raw_para: str, edited_para: str, start_id: int) -> dict:
+    """
+    Diff a single paragraph at the word level.
+    Returns dict with 'segments', 'changes' list, and 'next_id'.
+    Handles empty paragraphs gracefully.
+    """
+    # Handle completely empty paragraphs
+    if not raw_para and not edited_para:
+        return {"segments": [], "changes": [], "next_id": start_id}
+
+    # Handle when one side is empty
+    if not raw_para:
+        change_data = {
+            "id": start_id,
+            "old": "",
+            "new": edited_para,
+            "tag": "insert",
+            "context_before": "",
+            "context_after": "",
+        }
+        return {
+            "segments": [
+                {
+                    "html": f'<span style="background-color: #1e4620; font-weight: bold;">{html_mod.escape(edited_para)}</span>',
+                    "change": change_data,
                 }
-                cid += 1
-            elif tag == "insert":
-                new_text = " ".join(edited_words[j1:j2])
-                seg_html_parts.append(
-                    f'<span style="background-color: #1e4620; font-weight: bold; padding: 1px 3px; border-radius: 3px;">'
-                    f"{html_mod.escape(new_text)}</span>"
-                )
-                change_data = {
-                    "id": cid,
-                    "old": "",
-                    "new": new_text,
-                    "tag": "insert",
-                    "context_before": context_before,
-                    "context_after": context_after,
+            ],
+            "changes": [change_data],
+            "next_id": start_id + 1,
+        }
+
+    if not edited_para:
+        change_data = {
+            "id": start_id,
+            "old": raw_para,
+            "new": "",
+            "tag": "delete",
+            "context_before": "",
+            "context_after": "",
+        }
+        return {
+            "segments": [
+                {
+                    "html": f'<span style="background-color: #5c2020; text-decoration: line-through;">{html_mod.escape(raw_para)}</span>',
+                    "change": change_data,
                 }
-                cid += 1
-            elif tag == "replace":
-                old_text = " ".join(raw_words[i1:i2])
-                new_text = " ".join(edited_words[j1:j2])
-                seg_html_parts.append(
-                    f'<span style="background-color: #5c2020; text-decoration: line-through; padding: 1px 3px; border-radius: 3px;">'
-                    f"{html_mod.escape(old_text)}</span> "
-                    f'<span style="background-color: #1e4620; font-weight: bold; padding: 1px 3px; border-radius: 3px;">'
-                    f"{html_mod.escape(new_text)}</span>"
-                )
-                change_data = {
-                    "id": cid,
-                    "old": old_text,
-                    "new": new_text,
-                    "tag": "replace",
-                    "context_before": context_before,
-                    "context_after": context_after,
-                }
-                cid += 1
+            ],
+            "changes": [change_data],
+            "next_id": start_id + 1,
+        }
 
-            if op_idx + 1 < len(opcodes) and opcodes[op_idx + 1][0] == "equal":
-                _, ni1, ni2, _, _ = opcodes[op_idx + 1]
-                next_equal_words = raw_words[ni1:ni2]
-                if len(next_equal_words) > context_words_count:
-                    seg_html_parts.append(
-                        " ".join(
-                            html_mod.escape(w)
-                            for w in next_equal_words[:context_words_count]
-                        )
-                    )
-                    seg_html_parts.append(' <span style="color: #888;">…</span>')
+    # Tokenize while preserving newlines - treat newlines as separate tokens
+    raw_words = re.findall(r"\S+|\n", raw_para)
+    edited_words = re.findall(r"\S+|\n", edited_para)
+    matcher = difflib.SequenceMatcher(None, raw_words, edited_words)
 
-            segments.append({"html": " ".join(seg_html_parts), "change": change_data})
+    segments = []
+    cid = start_id
 
-    if pending_context:
-        segments.append({"html": " ".join(pending_context), "change": None})
+    opcodes = matcher.get_opcodes()
+
+    def join_tokens(tokens):
+        """Join tokens, using actual newlines for \n tokens and spaces for words."""
+        result = []
+        for i, token in enumerate(tokens):
+            if token == "\n":
+                result.append("\n")
+            else:
+                if i > 0 and tokens[i - 1] != "\n":
+                    result.append(" ")
+                result.append(token)
+        return "".join(result)
+
+    def escape_with_newlines(text):
+        """Escape HTML and convert newlines to <br> tags."""
+        escaped = html_mod.escape(text)
+        return escaped.replace("\n", "<br>")
+
+    for op_idx, (tag, i1, i2, j1, j2) in enumerate(opcodes):
+        # Build context references for rejection functionality
+        context_before = ""
+        context_after = ""
+        for prev_idx in range(op_idx - 1, -1, -1):
+            ptag, _, _, pj1, pj2 = opcodes[prev_idx]
+            if ptag in ("equal", "insert", "replace") and pj2 > pj1:
+                words = [w for w in edited_words[pj1:pj2] if w != "\n"]
+                context_before = " ".join(words[-5:])
+                break
+        for next_idx in range(op_idx + 1, len(opcodes)):
+            ntag, _, _, nj1, nj2 = opcodes[next_idx]
+            if ntag in ("equal", "insert", "replace") and nj2 > nj1:
+                words = [w for w in edited_words[nj1:nj2] if w != "\n"]
+                context_after = " ".join(words[:5])
+                break
+
+        if tag == "equal":
+            # Context text - not clickable
+            equal_text = escape_with_newlines(join_tokens(raw_words[i1:i2]))
+            segments.append({"html": equal_text, "change": None})
+        elif tag == "delete":
+            old_text = join_tokens(raw_words[i1:i2])
+            change_html = (
+                f'<span style="background-color: #5c2020; text-decoration: line-through; padding: 1px 3px; border-radius: 3px;">'
+                f"{escape_with_newlines(old_text)}</span>"
+            )
+            change_data = {
+                "id": cid,
+                "old": old_text,
+                "new": "",
+                "tag": "delete",
+                "context_before": context_before,
+                "context_after": context_after,
+            }
+            segments.append({"html": change_html, "change": change_data})
+            cid += 1
+        elif tag == "insert":
+            new_text = join_tokens(edited_words[j1:j2])
+            change_html = (
+                f'<span style="background-color: #1e4620; font-weight: bold; padding: 1px 3px; border-radius: 3px;">'
+                f"{escape_with_newlines(new_text)}</span>"
+            )
+            change_data = {
+                "id": cid,
+                "old": "",
+                "new": new_text,
+                "tag": "insert",
+                "context_before": context_before,
+                "context_after": context_after,
+            }
+            segments.append({"html": change_html, "change": change_data})
+            cid += 1
+        elif tag == "replace":
+            old_text = join_tokens(raw_words[i1:i2])
+            new_text = join_tokens(edited_words[j1:j2])
+            change_html = (
+                f'<span style="background-color: #5c2020; text-decoration: line-through; padding: 1px 3px; border-radius: 3px;">'
+                f"{escape_with_newlines(old_text)}</span> "
+                f'<span style="background-color: #1e4620; font-weight: bold; padding: 1px 3px; border-radius: 3px;">'
+                f"{escape_with_newlines(new_text)}</span>"
+            )
+            change_data = {
+                "id": cid,
+                "old": old_text,
+                "new": new_text,
+                "tag": "replace",
+                "context_before": context_before,
+                "context_after": context_after,
+            }
+            segments.append({"html": change_html, "change": change_data})
+            cid += 1
 
     all_changes = [s["change"] for s in segments if s["change"] is not None]
 
@@ -218,14 +318,28 @@ def apply_rejection(edited_text: str, change: dict) -> str:
     - For 'insert': remove the new text
     - For 'replace': swap new text back to old text
     """
-    if change["tag"] == "insert":
-        return edited_text.replace(change["new"], "", 1)
-    elif change["tag"] == "replace":
-        return edited_text.replace(change["new"], change["old"], 1)
-    elif change["tag"] == "delete":
+    if isinstance(change, dict) and "tag" not in change:
+        inner_change = change.get("change")
+        if isinstance(inner_change, dict) and "tag" in inner_change:
+            change = inner_change
+
+    tag = change.get("tag") if isinstance(change, dict) else None
+    if tag == "insert":
+        new_text = change.get("new", "")
+        return edited_text.replace(new_text, "", 1) if new_text else edited_text
+    elif tag == "replace":
+        new_text = change.get("new", "")
+        old_text = change.get("old", "")
+        if not new_text or not old_text:
+            return edited_text
+        return edited_text.replace(new_text, old_text, 1)
+    elif tag == "delete":
         ctx_before = change.get("context_before", "")
         ctx_after = change.get("context_after", "")
-        old_text = change["old"]
+        old_text = change.get("old", "")
+
+        if not old_text:
+            return edited_text
 
         if ctx_before and ctx_after:
             anchor = ctx_before + " " + ctx_after
