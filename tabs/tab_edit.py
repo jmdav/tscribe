@@ -199,6 +199,14 @@ def render_edit_tab(output_dir: Path, processed_dir: Path):
 
         batch_progress = st.progress(0.0, text="Batch Progress")
 
+        # Create single progress bar and preview container for the currently editing file
+        st.markdown("**Current File Progress:**")
+        file_progress_header = st.empty()
+        progress_bar = st.progress(0.0, text="Waiting to start...")
+        st.markdown("**Current Edit Preview:**")
+        with st.container(height=350, border=True):
+            edited_text_placeholder = st.empty()
+
         for file_index, file_str in enumerate(target_files):
             batch_pct = file_index / len(target_files)
             batch_progress.progress(
@@ -213,7 +221,7 @@ def render_edit_tab(output_dir: Path, processed_dir: Path):
             file_path = output_dir / file_str
             st.session_state.current_file = file_path.name
 
-            st.markdown(
+            file_progress_header.markdown(
                 f"### Processing ({file_index + 1}/{len(target_files)}): `{file_path.name}`"
             )
 
@@ -221,11 +229,10 @@ def render_edit_tab(output_dir: Path, processed_dir: Path):
             chunks = chunk_text(original_text, max_words=chunk_size, context_words=100)
             total_words = max(len(original_text.split()), 1)
 
-            st.info(f"Split into {len(chunks)} chunk(s). (~{total_words} words total)")
-            progress_bar = st.progress(0.0, text=f"Edited 0 / {total_words} words")
-
-            with st.container(height=350, border=True):
-                edited_text_placeholder = st.empty()
+            edited_text_placeholder.info(
+                f"Split into {len(chunks)} chunk(s). (~{total_words} words total)"
+            )
+            progress_bar.progress(0.0, text=f"Edited 0 / {total_words} words")
 
             for i, (context_text, chunk) in enumerate(chunks):
                 if st.session_state.get("cancel_batch", False):
@@ -312,17 +319,19 @@ def render_edit_tab(output_dir: Path, processed_dir: Path):
                         st.session_state.partial_text += "\n\n"
 
                 except requests.exceptions.Timeout:
-                    st.error(
-                        f"Timeout on chunk {i+1}: Ollama took too long. Check if model is running."
+                    edited_text_placeholder.error(
+                        f"❌ Timeout on chunk {i+1}: Ollama took too long. Check if model is running.\n\nFile: {file_path.name}"
                     )
                     break
                 except requests.exceptions.ConnectionError:
-                    st.error(
-                        f"Connection error on chunk {i+1}: Cannot reach Ollama at localhost:11434. Is it running?"
+                    edited_text_placeholder.error(
+                        f"❌ Connection error on chunk {i+1}: Cannot reach Ollama at localhost:11434. Is it running?\n\nFile: {file_path.name}"
                     )
                     break
                 except Exception as e:
-                    st.error(f"Error on chunk {i+1}: {type(e).__name__}: {e}")
+                    edited_text_placeholder.error(
+                        f"❌ Error on chunk {i+1}: {type(e).__name__}: {e}\n\nFile: {file_path.name}"
+                    )
                     break
 
             if st.session_state.partial_text:
@@ -332,11 +341,13 @@ def render_edit_tab(output_dir: Path, processed_dir: Path):
                 new_file_path.write_text(
                     st.session_state.partial_text, encoding="utf-8"
                 )
-                st.success(
-                    f"File complete! Saved to `{new_file_path.name}` in Processed folder."
+                edited_text_placeholder.success(
+                    f"✅ Completed: {file_path.name}\n\nSaved to `{new_file_path.name}` in Processed folder."
                 )
+                progress_bar.progress(1.0, text=f"Completed: {file_path.name}")
                 st.session_state.partial_text = ""
                 st.session_state.current_file = ""
 
+        batch_progress.progress(1.0, text="Batch complete!")
         st.session_state.editing = False
         st.rerun()

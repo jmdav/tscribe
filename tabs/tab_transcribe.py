@@ -170,6 +170,12 @@ def render_transcribe_tab(in_dir: Path, out_dir: Path):
         )
         start_time = time.time()
 
+        # Create a single preview container for the currently transcribing file
+        st.markdown("**Current Transcription Preview:**")
+        with st.container(height=350, border=True):
+            live_preview = st.empty()
+        file_progress = st.progress(0.0, text="Waiting to start...")
+
         for i, src in enumerate(selected_paths):
             rel_path = src.relative_to(in_dir)
             out_txt = (out_dir / rel_path).with_suffix(".txt")
@@ -179,6 +185,7 @@ def render_transcribe_tab(in_dir: Path, out_dir: Path):
 
             if out_txt.exists():
                 log_msg(f"Skipped (already exists): {out_txt.name}")
+                live_preview.info(f"Skipped: {src.name} (already exists)")
             else:
                 try:
                     segments, info = model.transcribe(
@@ -192,13 +199,12 @@ def render_transcribe_tab(in_dir: Path, out_dir: Path):
                     log_msg(
                         f"! Transcription failed on {src.name}: {type(e).__name__}: {e}"
                     )
+                    live_preview.error(f"Transcription failed on {src.name}")
                     continue
 
-                file_progress = st.progress(
+                file_progress.progress(
                     0.0, text=f"Processing {info.duration:.1f}s audio..."
                 )
-                with st.container(height=350, border=True):
-                    live_preview = st.empty()
 
                 text_chunks = []
                 segment_count = 0
@@ -216,16 +222,14 @@ def render_transcribe_tab(in_dir: Path, out_dir: Path):
                             full_text = " ".join(text_chunks).strip()
                             live_preview.markdown(full_text + "▌")
 
-                    file_progress.empty()
-                    live_preview.empty()
-
                     text = " ".join(text_chunks).strip()
                     out_txt.write_text(text, encoding="utf-8")
                     log_msg(f"Wrote transcript: {out_txt.name} ({len(text)} chars)")
+                    live_preview.success(f"✅ Completed: {src.name}")
+                    file_progress.progress(1.0, text=f"Completed: {src.name}")
                 except Exception as e:
                     log_msg(f"! Processing error on {src.name}: {type(e).__name__}")
-                    file_progress.empty()
-                    live_preview.empty()
+                    live_preview.error(f"❌ Error processing: {src.name}")
 
         total_time = time.time() - start_time
         m, s = divmod(int(total_time), 60)
