@@ -8,12 +8,12 @@ MODEL_STATS = {
 }
 
 HIDE_ST_STYLE = """
-            <style>
-            [data-testid="stToolbar"] {visibility: hidden !important;}
-            [data-testid="stHeader"] {visibility: hidden !important;}
-            footer {visibility: hidden !important;}
-            .stMarkdown h1 a, .stMarkdown h2 a, .stMarkdown h3 a,
-            .stMarkdown h4 a, .stMarkdown h5 a, .stMarkdown h6 a,
-            [data-testid="stHeaderActionElements"] {display: none !important;}
-            </style>
-            """
+<style>
+[data-testid="stToolbar"] {visibility: hidden !important;}
+[data-testid="stHeader"] {visibility: hidden !important;}
+footer {visibility: hidden !important;}
+.stMarkdown h1 a, .stMarkdown h2 a, .stMarkdown h3 a,
+.stMarkdown h4 a, .stMarkdown h5 a, .stMarkdown h6 a,
+[data-testid="stHeaderActionElements"] {display: none !important;}
+</style>
+"""

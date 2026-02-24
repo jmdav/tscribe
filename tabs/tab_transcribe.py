@@ -8,7 +8,7 @@ from utils.file_utils import find_media_files, get_media_duration
 from utils.model import load_model
 
 
-def render_transcribe_tab(in_dir: Path, out_dir: Path, proc_dir: Path):
+def render_transcribe_tab(in_dir: Path, out_dir: Path):
     """Transcription tab with built-in settings and file selection."""
 
     # Initialize processing state
@@ -197,7 +197,8 @@ def render_transcribe_tab(in_dir: Path, out_dir: Path, proc_dir: Path):
                 file_progress = st.progress(
                     0.0, text=f"Processing {info.duration:.1f}s audio..."
                 )
-                live_preview = st.empty()
+                with st.container(height=350, border=True):
+                    live_preview = st.empty()
 
                 text_chunks = []
                 segment_count = 0
@@ -212,7 +213,8 @@ def render_transcribe_tab(in_dir: Path, out_dir: Path, proc_dir: Path):
                                 percent_done,
                                 text=f"Transcribing *{src.name}*: {percent_done:.0%}",
                             )
-                            live_preview.caption(f"...{segment.text.strip()[-120:]}")
+                            full_text = " ".join(text_chunks).strip()
+                            live_preview.markdown(full_text + "▌")
 
                     file_progress.empty()
                     live_preview.empty()

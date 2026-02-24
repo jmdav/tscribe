@@ -27,14 +27,70 @@ interface ClickableDiffProps extends ComponentProps {
   };
 }
 
-const ClickableDiff: React.FC<ClickableDiffProps> = ({ args, theme }) => {
+// Static styles moved outside component to avoid recreation on each render
+const baseButtonStyle: React.CSSProperties = {
+  backgroundColor: "var(--primary-color, #ff4b4b)",
+  color: "var(--background-color, #ffffff)",
+  border: "1px solid var(--primary-color, #ff4b4b)",
+  padding: "0.45rem 0.9rem",
+  borderRadius: "0.5rem",
+  cursor: "pointer",
+  fontSize: "16px",
+  fontWeight: "600",
+  marginRight: "8px",
+};
+
+const baseUndoButtonStyle: React.CSSProperties = {
+  ...baseButtonStyle,
+  backgroundColor: "var(--secondary-background-color, #f0f2f6)",
+  color: "var(--text-color, #262730)",
+  border: "1px solid rgba(49, 51, 63, 0.2)",
+};
+
+const baseDisabledButtonStyle: React.CSSProperties = {
+  ...baseUndoButtonStyle,
+  cursor: "not-allowed",
+  opacity: 0.5,
+};
+
+const stickyBarStyle: React.CSSProperties = {
+  position: "sticky",
+  top: 0,
+  zIndex: 5,
+  backgroundColor: "var(--background-color, #ffffff)",
+  borderBottom: "1px solid rgba(49, 51, 63, 0.12)",
+  padding: "8px 0",
+  marginBottom: "8px",
+};
+
+const barContentStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: "8px",
+  flexWrap: "wrap",
+};
+
+const toggleButtonStyle: React.CSSProperties = {
+  ...baseUndoButtonStyle,
+  padding: "0.35rem 0.75rem",
+  fontSize: "14px",
+};
+
+const buttonGroupStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: "8px",
+  flexWrap: "wrap",
+};
+
+const ClickableDiff: React.FC<ClickableDiffProps> = ({ args }) => {
   const { segments, height, edited_text } = args;
   const [hoveredId, setHoveredId] = useState<number | null>(null);
   const [rejectedChanges, setRejectedChanges] = useState<Change[]>([]);
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
   const [isEditMode, setIsEditMode] = useState(false);
   const [editableText, setEditableText] = useState<string>(edited_text || "");
-  const [scrollPosition, setScrollPosition] = useState(0);
   const containerRef = React.useRef<HTMLDivElement>(null);
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
 
@@ -298,6 +354,7 @@ const ClickableDiff: React.FC<ClickableDiffProps> = ({ args, theme }) => {
     }
   };
 
+  // Only height-dependent styles need to be inside the component
   const containerStyle: React.CSSProperties = {
     padding: "0.75rem 1rem",
     backgroundColor: "var(--secondary-background-color, #f0f2f6)",
@@ -308,78 +365,17 @@ const ClickableDiff: React.FC<ClickableDiffProps> = ({ args, theme }) => {
     color: "var(--text-color, #262730)",
     whiteSpace: "pre-wrap",
     wordWrap: "break-word",
-    ...(height
-      ? {
-          maxHeight: `${height}px`,
-          overflowY: "auto",
-        }
-      : {}),
-  };
-
-  const buttonStyle: React.CSSProperties = {
-    backgroundColor: "var(--primary-color, #ff4b4b)",
-    color: "var(--background-color, #ffffff)",
-    border: "1px solid var(--primary-color, #ff4b4b)",
-    padding: "0.45rem 0.9rem",
-    borderRadius: "0.5rem",
-    cursor: "pointer",
-    fontSize: "16px",
-    fontWeight: "600",
-    marginRight: "8px",
-  };
-
-  const undoButtonStyle: React.CSSProperties = {
-    ...buttonStyle,
-    backgroundColor: "var(--secondary-background-color, #f0f2f6)",
-    color: "var(--text-color, #262730)",
-    border: "1px solid rgba(49, 51, 63, 0.2)",
-  };
-
-  const disabledButtonStyle: React.CSSProperties = {
-    ...undoButtonStyle,
-    cursor: "not-allowed",
-    opacity: 0.5,
-  };
-
-  const stickyBarStyle: React.CSSProperties = {
-    position: "sticky",
-    top: 0,
-    zIndex: 5,
-    backgroundColor: "var(--background-color, #ffffff)",
-    borderBottom: "1px solid rgba(49, 51, 63, 0.12)",
-    padding: "8px 0",
-    marginBottom: "8px",
-  };
-
-  const barContentStyle: React.CSSProperties = {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: "8px",
-    flexWrap: "wrap",
-  };
-
-  const toggleButtonStyle: React.CSSProperties = {
-    ...undoButtonStyle,
-    padding: "0.35rem 0.75rem",
-    fontSize: "14px",
-  };
-
-  const buttonGroupStyle: React.CSSProperties = {
-    display: "flex",
-    alignItems: "center",
-    gap: "8px",
-    flexWrap: "wrap",
+    ...(height ? { maxHeight: `${height}px`, overflowY: "auto" as const } : {}),
   };
 
   const editAreaStyle: React.CSSProperties = {
-    width: "100%",
+    width: "calc(100% + 2rem)",
     minHeight: "320px",
     height: height ? `${height}px` : "auto",
     resize: "none",
     borderRadius: "8px",
     border: "none",
-    padding: "0.75rem 1rem",
+    padding: 0,
     fontFamily: "var(--font, inherit)",
     fontSize: "18px",
     lineHeight: 1.7,
@@ -400,8 +396,6 @@ const ClickableDiff: React.FC<ClickableDiffProps> = ({ args, theme }) => {
                 const currentScroll = isEditMode
                   ? textareaRef.current?.scrollTop || 0
                   : containerRef.current?.scrollTop || 0;
-                setScrollPosition(currentScroll);
-                
                 setIsEditMode((prev) => {
                   const newMode = !prev;
                   // Restore scroll position after mode switch
@@ -426,7 +420,7 @@ const ClickableDiff: React.FC<ClickableDiffProps> = ({ args, theme }) => {
             </button>
             <button
               onClick={handleSave}
-              style={hasUnsavedChanges ? buttonStyle : disabledButtonStyle}
+              style={hasUnsavedChanges ? baseButtonStyle : baseDisabledButtonStyle}
               disabled={!hasUnsavedChanges}
               title={
                 rejectedChanges.length > 0
@@ -438,7 +432,7 @@ const ClickableDiff: React.FC<ClickableDiffProps> = ({ args, theme }) => {
             </button>
             <button
               onClick={handleUndo}
-              style={rejectedChanges.length > 0 ? undoButtonStyle : disabledButtonStyle}
+              style={rejectedChanges.length > 0 ? baseUndoButtonStyle : baseDisabledButtonStyle}
               disabled={rejectedChanges.length === 0}
               title="Undo last rejection"
             >
@@ -461,10 +455,6 @@ const ClickableDiff: React.FC<ClickableDiffProps> = ({ args, theme }) => {
       <div
         ref={containerRef}
         style={containerStyle}
-        onScroll={(e) => {
-          const target = e.target as HTMLDivElement;
-          setScrollPosition(target.scrollTop);
-        }}
       >
         {isEditMode ? (
           <textarea
@@ -473,10 +463,6 @@ const ClickableDiff: React.FC<ClickableDiffProps> = ({ args, theme }) => {
             onChange={(event) => {
               setEditableText(event.target.value);
               setHasUnsavedChanges(true);
-            }}
-            onScroll={(e) => {
-              const target = e.target as HTMLTextAreaElement;
-              setScrollPosition(target.scrollTop);
             }}
             style={editAreaStyle}
             spellCheck

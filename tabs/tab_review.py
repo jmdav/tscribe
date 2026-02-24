@@ -1,9 +1,7 @@
-import html
-import time
 import streamlit as st
 from pathlib import Path
 
-from utils.diff_utils import generate_html_diff, build_paragraph_diffs, apply_rejection
+from utils.diff_utils import build_paragraph_diffs, apply_rejection
 from components.clickable_diff import clickable_diff
 
 
@@ -57,12 +55,8 @@ def render_diff_view(
     # Build continuous diff
     para_diffs = build_paragraph_diffs(raw_text, current_proc_text)
 
-    # Flatten all segments (now just one "paragraph" containing everything)
-    all_segments = []
-    for para in para_diffs:
-        if para.get("segments"):
-            for seg in para["segments"]:
-                all_segments.append(seg)
+    # Flatten all segments
+    all_segments = [seg for para in para_diffs for seg in para.get("segments", [])]
 
     # Render the clickable diff component with revision in key to force refresh
     revision = st.session_state.diff_revision[selected_base]
@@ -180,7 +174,6 @@ def render_review_tab(output_dir: Path, processed_dir: Path):
 
     elif view_mode == "Diff View":
         if raw_text and proc_text:
-            st.markdown("### Difference Highlight")
             render_diff_view(selected_base, raw_text, proc_text, proc_file)
         elif not proc_text:
             st.info("No edited version available to compare. Go to the 'Edit' tab.")
@@ -188,12 +181,10 @@ def render_review_tab(output_dir: Path, processed_dir: Path):
             st.warning("No raw transcript found for comparison.")
 
     elif view_mode == "Raw Only":
-        st.markdown(f"### Raw Transcript: {selected_base}")
         st.text_area("Raw Content", raw_text, height=700, label_visibility="collapsed")
 
     elif view_mode == "Edited Only":
         if proc_text:
-            st.markdown(f"### AI Polished: {selected_base}")
             st.text_area(
                 "Edited Content", proc_text, height=700, label_visibility="collapsed"
             )

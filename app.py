@@ -69,7 +69,7 @@ for error in errors:
 tab_transcribe, tab_process, tab_edit = st.tabs(["Transcribe", "Process", "Edit"])
 
 with tab_transcribe:
-    render_transcribe_tab(input_dir, output_dir, processed_dir)
+    render_transcribe_tab(input_dir, output_dir)
 
 with tab_process:
     render_edit_tab(output_dir, processed_dir)

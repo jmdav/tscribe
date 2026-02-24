@@ -18,9 +18,7 @@ def render_edit_tab(output_dir: Path, processed_dir: Path):
     ollama_models = get_ollama_models()
 
     if not ollama_models:
-        st.warning(
-            "⚠️ No local Ollama models detected. Please use the Ollama CLI to install models first."
-        )
+        st.warning("⚠️ Ollama not detected. Ensure Ollama is running on your machine.")
         return
 
     if not output_dir.exists():
@@ -43,22 +41,6 @@ def render_edit_tab(output_dir: Path, processed_dir: Path):
                 ollama_models,
                 disabled=st.session_state.editing,
                 help="LLM model to use for grammar correction and formatting.",
-            )
-
-            # Device selection for Ollama (supports CPU, MPS, and CUDA)
-            import torch
-
-            device_options = ["CPU"]
-            if torch.backends.mps.is_available():
-                device_options.append("MPS")
-            if torch.cuda.is_available():
-                device_options.append("CUDA")
-
-            device = st.selectbox(
-                "Device",
-                device_options,
-                help="Ollama supports CPU (universal), MPS (Metal GPU on Apple Silicon), and CUDA. The device setting affects inference performance through Ollama's configuration.",
-                disabled=st.session_state.editing,
             )
 
             context_window = st.number_input(
@@ -147,23 +129,22 @@ def render_edit_tab(output_dir: Path, processed_dir: Path):
 
     with edit_col2:
         if target_files:
-            st.dataframe(
-                [
-                    {
-                        "Filename": name,
-                        "Words": len(
-                            (output_dir / name).read_text(encoding="utf-8").split()
-                        ),
-                        "Size (KB)": round(
-                            (output_dir / name).stat().st_size / 1024, 1
-                        ),
-                    }
-                    for name in target_files
-                    if (output_dir / name).exists()
-                ],
-                width="stretch",
-                hide_index=True,
-            )
+            # Build file info once, using size as proxy for word count to avoid reading files
+            file_info = []
+            for name in target_files:
+                fpath = output_dir / name
+                if fpath.exists():
+                    size_kb = fpath.stat().st_size / 1024
+                    file_info.append(
+                        {
+                            "Filename": name,
+                            "Est. Words": int(
+                                size_kb * 150
+                            ),  # ~150 words per KB for text
+                            "Size (KB)": round(size_kb, 1),
+                        }
+                    )
+            st.dataframe(file_info, width="stretch", hide_index=True)
 
         btn_col1, btn_col2 = st.columns(2)
         with btn_col1:
@@ -293,7 +274,6 @@ def render_edit_tab(output_dir: Path, processed_dir: Path):
                         )
                         res.raise_for_status()
 
-                        chunk_tokens = []
                         last_ui_update = time.time()
                         for line in res.iter_lines():
                             if line:
@@ -303,7 +283,6 @@ def render_edit_tab(output_dir: Path, processed_dir: Path):
                                         "message", {}
                                     ):
                                         token = body["message"]["content"]
-                                        chunk_tokens.append(token)
                                         st.session_state.partial_text += token
 
                                         now = time.time()
@@ -317,16 +296,8 @@ def render_edit_tab(output_dir: Path, processed_dir: Path):
                                                 pct,
                                                 text=f"Chunk {i+1}/{len(chunks)} · ~{current_words} / {total_words} words",
                                             )
-                                            preview = st.session_state.partial_text[
-                                                -1500:
-                                            ]
-                                            if (
-                                                len(st.session_state.partial_text)
-                                                > 1500
-                                            ):
-                                                preview = "..." + preview
                                             edited_text_placeholder.markdown(
-                                                preview + "▌"
+                                                st.session_state.partial_text + "▌"
                                             )
                                 except json.JSONDecodeError:
                                     continue
@@ -337,10 +308,7 @@ def render_edit_tab(output_dir: Path, processed_dir: Path):
                             pct,
                             text=f"Edited ~{current_words} / {total_words} words",
                         )
-                        preview = st.session_state.partial_text[-1500:]
-                        if len(st.session_state.partial_text) > 1500:
-                            preview = "..." + preview
-                        edited_text_placeholder.markdown(preview)
+                        edited_text_placeholder.markdown(st.session_state.partial_text)
                         st.session_state.partial_text += "\n\n"
 
                 except requests.exceptions.Timeout:
@@ -370,6 +338,5 @@ def render_edit_tab(output_dir: Path, processed_dir: Path):
                 st.session_state.partial_text = ""
                 st.session_state.current_file = ""
 
-        st.balloons()
         st.session_state.editing = False
         st.rerun()
