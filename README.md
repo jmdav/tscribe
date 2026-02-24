@@ -1,25 +1,31 @@
 # tScribe
 
-Simple Python script with streamlit GUI for batch transcribing audio files.
+## Features
+
+- Batch transcribe audio/video files with txt output
+- Batch transcript processing using local Ollama models for summarization or grammar
+- Review transcripts with diff view / undo for LLM edits
+
+## Requirements
+
+- Python 3.10+ (3.11 recommended)
+- `ffmpeg` available on PATH (required by Whisper/faster-whisper)
+- Optional: Ollama running locally for transcript processing
 
 ## Installation
 
-```bash
-pip install -r requirements.txt
-```
-
-### Building the Clickable Diff Component
-
-The Review tab uses a custom Streamlit component for clickable diff text. The component is pre-built, but if you need to rebuild it:
+macOS/Linux:
 
 ```bash
-cd components/clickable_diff/frontend
-npm install
-npm run build
+chmod +x run.sh
+./run.sh
 ```
 
-## Usage
+Windows (PowerShell):
 
-```bash
-streamlit run app.py
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+./run.ps1
 ```
+
+By default, put media files in `in/` and check transcripts in `out/`. Processed/edited output goes to `processed/`.
